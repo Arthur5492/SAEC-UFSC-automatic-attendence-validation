@@ -1,0 +1,6 @@
+relatorio.txt
+*.xlsx
+*.json
+*.csv
+*.pdf
+disciplinas/*
