@@ -1,11 +1,6 @@
-# /// script
-# requires-python = ">=3.10"
-# dependencies = ["openpyxl", "pdfplumber"]
-# ///
-"""Gera presença.{csv,xlsx,json} por disciplina a partir dos check-ins da Semana Acadêmica (Even3).
+"""Gera a presença de cada disciplina a partir dos check-ins da SAEC no Even3.
 
-Uso: pip install -r requirements.txt && python gerar_presenca.py
-     (ou: uv run gerar_presenca.py)
+Uso: python gerar_presenca.py
 """
 import csv
 import json
@@ -18,6 +13,7 @@ from pathlib import Path
 
 import openpyxl
 import pdfplumber
+from openpyxl.styles import Font, PatternFill
 
 BASE = Path(__file__).resolve().parent
 PLANILHA = next(BASE.glob("ListaParticipante_*.xlsx"))
@@ -26,16 +22,20 @@ PASTA_DISCIPLINAS = BASE / "disciplinas"
 METADATA = PASTA_DISCIPLINAS / "metadata.json"
 RELATORIO = BASE / "relatorio.txt"
 
-INICIO_SAEC = date(2026, 10, 5)  # data inicio(segunda-feira) da Semana Acadêmica
+INICIO_SAEC = date(2026, 10, 5)  # segunda-feira da semana acadêmica
 DURACAO_PERIODO = timedelta(minutes=50)
 DIAS = {
-    2: "segunda-feira", 
-    3: "terça-feira", 
+    2: "segunda-feira",
+    3: "terça-feira",
     4: "quarta-feira",
-    5: "quinta-feira", 
-    6: "sexta-feira"}
+    5: "quinta-feira",
+    6: "sexta-feira",
+}
 
-DIA_PRESENCA_OPCIONAL = 6  # sexta-feira tivemos hackathon com vagas limitadas, nem todos os alunos tiveram oportunidade de presenciar.
+# Na sexta teve hackathon com vagas limitadas, então nem todos puderam participar
+DIA_PRESENCA_OPCIONAL = 6
+
+CORES = {"presente": "C6EFCE", "ausente": "FFC7CE", "presença opcional": "E7E6E6"}
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -57,7 +57,8 @@ def somente_digitos(texto):
     return re.sub(r"\D", "", str(texto or ""))
 
 
-#? Mapear nome/e-mail -> matrícula Pelo site utilizado para credenciamento Even3(https://www.even3.com.br)
+#? Inscrições do Even3: nome/e-mail -> matrícula
+
 def carregar_inscricoes():
     linhas = list(openpyxl.load_workbook(PLANILHA, read_only=True).active.iter_rows(values_only=True))
     cab = [normalizar(c) for c in linhas[0]]
@@ -75,7 +76,7 @@ def carregar_inscricoes():
         chave = normalizar(nome)
         contagem[chave] += 1
 
-        # Inscrições duplicadas: mescla mantendo a matrícula não vazia
+        # tem gente inscrita duas vezes, junta e fica com a matrícula preenchida
         pessoa = por_nome.get(chave) or por_email.get(email) or {"nome": nome, "matricula": "", "bruta": ""}
         if mat and not pessoa["matricula"]:
             pessoa["matricula"], pessoa["bruta"] = mat, mat_bruta
@@ -91,7 +92,7 @@ def carregar_inscricoes():
     return por_nome, por_email
 
 
-# --- 2. PDFs de presença: matrícula -> eventos -------------------------------
+#? Listas de presença (PDF): matrícula -> eventos
 
 def carregar_eventos():
     eventos = []
@@ -115,7 +116,7 @@ def carregar_eventos():
 
 
 def mapear_presencas(eventos, por_nome, por_email):
-    presencas = defaultdict(list)  # matrícula -> [evento]
+    presencas = defaultdict(list)
     avisados = set()
     for ev in eventos:
         for nome, email in ev["participantes"]:
@@ -134,12 +135,12 @@ def mapear_presencas(eventos, por_nome, por_email):
     return presencas
 
 
-# --- 3. Horários das aulas ---------------------------------------------------
+#? Turmas e horários das aulas
 
 def parse_horario(horario):
-    """'2.1420-2 / CTS-SL313A' -> (dia_semana, inicio, fim)"""
+    # formato do CAGR: "2.1420-2 / CTS-SL313A" = segunda, 14:20, 2 períodos
     m = re.match(r"\s*(\d)\.(\d{2})(\d{2})-(\d+)", horario)
-    dia_semana, hh, mm, periodos = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+    dia_semana, hh, mm, periodos = (int(g) for g in m.groups())
     dia = INICIO_SAEC + timedelta(days=dia_semana - 2)
     inicio = datetime(dia.year, dia.month, dia.day, hh, mm)
     return dia_semana, inicio, inicio + periodos * DURACAO_PERIODO
@@ -150,16 +151,15 @@ def esteve_na_aula(eventos_aluno, blocos):
                for ev in eventos_aluno for inicio, fim in blocos)
 
 
-# --- 4. Gera presença.csv por disciplina -------------------------------------
-
 def ler_alunos(pasta):
-    arquivos = [f for f in pasta.glob("*.csv") if f.name != "presença.csv"]
+    arquivo = next(f for f in pasta.glob("*.csv") if f.name != "presença.csv")
     alunos = []
-    with open(arquivos[0], encoding="utf-8-sig", newline="") as f:
+    with open(arquivo, encoding="utf-8-sig", newline="") as f:
         for linha in csv.DictReader(f):
-            nome = f"{linha['Nome']} {linha['Sobrenome']}".strip()
+            # o Moodle exporta a matrícula no campo Sobrenome, entre parênteses
             mat = re.fullmatch(r"\s*\((\d+)\)\s*", linha["Sobrenome"])
-            if not mat:  # ex.: professor inscrito na turma
+            if not mat:  # professores e monitores
+                nome = f"{linha['Nome']} {linha['Sobrenome']}".strip()
                 aviso("Linhas das turmas sem matrícula (ignoradas)", f"{pasta.name}: {nome} não contém matrícula na lista da turma")
                 continue
             alunos.append((linha["Nome"].strip(), mat.group(1), linha["Endereço de email"].strip().lower()))
@@ -167,8 +167,8 @@ def ler_alunos(pasta):
 
 
 def corrigir_matriculas(presencas, por_nome, por_email, turmas):
-    """Quem informou matrícula que não está em nenhuma turma, mas cujo nome/e-mail bate com um
-    aluno de turma, provavelmente digitou errado: as presenças passam para a matrícula da turma."""
+    # Se a matrícula do Even3 não está em nenhuma turma mas o nome ou e-mail bate,
+    # a pessoa digitou errado. Usa a matrícula da turma.
     matriculas_em_turmas, turma_por_nome, turma_por_email = set(), {}, {}
     for disc, alunos in turmas:
         for nome, mat, email in alunos:
@@ -191,10 +191,31 @@ def corrigir_matriculas(presencas, por_nome, por_email, turmas):
                 f"{p['nome']} - matrícula informada: {p['bruta']}")
 
 
-# --- 5. Saída em .csv, .xlsx e .json -----------------------------------------
+def montar_tabela(disc, alunos, presencas):
+    blocos_por_dia = defaultdict(list)
+    for h in disc["horarios"]:
+        dia_semana, inicio, fim = parse_horario(h)
+        blocos_por_dia[dia_semana].append((inicio, fim))
+    dias = sorted(blocos_por_dia)
 
-CORES = {"presente": "C6EFCE", "ausente": "FFC7CE", "presença opcional": "E7E6E6"}
+    cabecalho = ["Nome", "Matrícula"] + [DIAS[d] for d in dias]
+    linhas, presentes = [], 0
+    for nome, mat, _ in alunos:
+        linha, foi = [nome, mat], False
+        for d in dias:
+            if d == DIA_PRESENCA_OPCIONAL:
+                linha.append("presença opcional")
+            elif esteve_na_aula(presencas.get(mat, []), blocos_por_dia[d]):
+                linha.append("presente")
+                foi = True
+            else:
+                linha.append("ausente")
+        linhas.append(linha)
+        presentes += foi
+    return cabecalho, linhas, presentes
 
+
+#? Saída
 
 def salvar_csv(caminho, cabecalho, linhas):
     with open(caminho, "w", encoding="utf-8-sig", newline="") as f:
@@ -204,8 +225,6 @@ def salvar_csv(caminho, cabecalho, linhas):
 
 
 def salvar_xlsx(caminho, cabecalho, linhas, disc):
-    from openpyxl.styles import Font, PatternFill
-
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = disc["id"]
@@ -239,6 +258,14 @@ def salvar_json(caminho, cabecalho, linhas, disc):
     caminho.write_text(json.dumps(dados, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def salvar_relatorio():
+    with open(RELATORIO, "w", encoding="utf-8") as f:
+        for secao, itens in relatorio.items():
+            f.write(f"== {secao} ({len(itens)}) ==\n")
+            f.writelines(f"  {i}\n" for i in itens)
+            f.write("\n")
+
+
 def main():
     por_nome, por_email = carregar_inscricoes()
     eventos = carregar_eventos()
@@ -250,44 +277,20 @@ def main():
 
     for disc, alunos in turmas:
         pasta = PASTA_DISCIPLINAS / disc["id"]
-        blocos_por_dia = defaultdict(list)
-        for h in disc["horarios"]:
-            dia_semana, inicio, fim = parse_horario(h)
-            blocos_por_dia[dia_semana].append((inicio, fim))
-        dias = sorted(blocos_por_dia)
-
-        cabecalho = ["Nome", "Matrícula"] + [DIAS[d] for d in dias]
-        linhas, presentes = [], 0
-        for nome, mat, _ in alunos:
-            linha, algum = [nome, mat], False
-            for d in dias:
-                if d == DIA_PRESENCA_OPCIONAL:
-                    linha.append("presença opcional")
-                elif esteve_na_aula(presencas.get(mat, []), blocos_por_dia[d]):
-                    linha.append("presente")
-                    algum = True
-                else:
-                    linha.append("ausente")
-            linhas.append(linha)
-            presentes += algum
-
+        cabecalho, linhas, presentes = montar_tabela(disc, alunos, presencas)
         disc["total_alunos"] = str(len(alunos))
         disc["alunos_presentes"] = str(presentes)
+
         salvar_csv(pasta / "presença.csv", cabecalho, linhas)
         salvar_xlsx(pasta / "presença.xlsx", cabecalho, linhas, disc)
         salvar_json(pasta / "presença.json", cabecalho, linhas, disc)
         relatorio["Resumo por disciplina"].append(
             f"{disc['id']} - {disc['name']}: {presentes}/{len(alunos)} alunos com ao menos uma presença")
-        print(f"{disc['id']}: {presentes}/{len(alunos)} presentes -> {pasta / 'presença'}.{{csv,xlsx,json}}")
+        print(f"{disc['id']}: {presentes}/{len(alunos)} presentes")
 
     METADATA.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
-    with open(RELATORIO, "w", encoding="utf-8") as f:
-        for secao, itens in relatorio.items():
-            f.write(f"== {secao} ({len(itens)}) ==\n")
-            f.writelines(f"  {i}\n" for i in itens)
-            f.write("\n")
-    print(f"Relatório: {RELATORIO}")
+    salvar_relatorio()
+    print(f"Relatório salvo em {RELATORIO.name}")
 
 
 if __name__ == "__main__":

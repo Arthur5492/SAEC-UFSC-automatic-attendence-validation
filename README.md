@@ -40,8 +40,6 @@ pip install -r requirements.txt
 python gerar_presenca.py
 ```
 
-Se preferir o [uv](https://docs.astral.sh/uv/), `uv run gerar_presenca.py` instala as dependências sozinho.
-
 Cada pasta `disciplinas/<ID>/` recebe `presença.xlsx`, `presença.csv` e `presença.json`, com nome, matrícula e presença em cada dia de aula.
 
 ## Cronograma da SAEC
